@@ -298,7 +298,8 @@ class Model(nn.Module):
                                         stride=1,
                                         padding=1)
         
-        self.Fourier = Fourier(lowpass=True)
+        # self.Fourier = Fourier(lowpass=True)
+        self.Fourier = LearnableFourier(hidden_size=512) # choose beetween Fourier or LearnableFourier
 
     def forward(self, x, t):
         assert x.shape[2] == x.shape[3] == self.resolution
@@ -306,7 +307,7 @@ class Model(nn.Module):
         # Fourier feature extraction
         tmp = x.clone()
         x_orig = tmp[:, :1].squeeze(1)  # B,H,W
-        ff = self.Fourier.forward(x_orig) # B, H, W/2+1
+        ff = self.Fourier(x_orig) # B, H, W//2+1
 
         # timestep embedding
         temb = get_timestep_embedding(t, self.ch)

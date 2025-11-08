@@ -5,84 +5,99 @@ import math
 
 class LearnableFourier(nn.Module):
     """
-    hidden_size: channel dimension size
-    num_blocks: how many blocks to use in the block diagonal weight matrices (higher => less complexity but less parameters)
-    sparsity_threshold: lambda for softshrink
-    hard_thresholding_fraction: how many frequencies you want to completely mask out (lower => hard_thresholding_fraction^2 less FLOPs)
+    Learnable 2D Fourier feature transformer for grayscale (CT) images.
+    Input: (B, H, W)
+    Output: transformed Fourier features (complex)
+    Reference: https://github.com/AI4Science-WestlakeU/FourierFlow/blob/main/models/afno2d.py#L118
     """
-    def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
+    def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01,
+                 hard_thresholding_fraction=1.0, hidden_size_factor=1):
         super().__init__()
-        assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisble by num_blocks {num_blocks}"
+        assert hidden_size % num_blocks == 0, \
+            f"hidden_size {hidden_size} must be divisible by num_blocks {num_blocks}"
 
         self.hidden_size = hidden_size
-        self.sparsity_threshold = sparsity_threshold
         self.num_blocks = num_blocks
-        self.block_size = self.hidden_size // self.num_blocks
+        self.block_size = hidden_size // num_blocks
+        self.sparsity_threshold = sparsity_threshold
         self.hard_thresholding_fraction = hard_thresholding_fraction
         self.hidden_size_factor = hidden_size_factor
         self.scale = 0.02
 
-        self.w1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size, self.block_size * self.hidden_size_factor))
-        self.b1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor))
-        self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor, self.block_size))
-        self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size))
-        
-        self.alpha = 1.0 
-        num_layers = 2
-        self.gamma = nn.ParameterList([nn.Parameter(torch.tensor(1.0)) for _ in range(num_layers)])
+        # learnable block weights (real + imag)
+        self.w_real = nn.Parameter(self.scale * torch.randn(num_blocks, self.block_size, self.block_size * hidden_size_factor))
+        self.w_imag = nn.Parameter(self.scale * torch.randn(num_blocks, self.block_size, self.block_size * hidden_size_factor))
+        self.b_real = nn.Parameter(self.scale * torch.randn(num_blocks, self.block_size * hidden_size_factor))
+        self.b_imag = nn.Parameter(self.scale * torch.randn(num_blocks, self.block_size * hidden_size_factor))
+
+        self.gamma = nn.Parameter(torch.tensor(1.0))
+        self.alpha = 1.0
 
     def forward(self, x):
-        
-        x = x.float()
+        """
+        x: (B, H, W)
+        returns: transformed Fourier feature (B, H, W//2+1)
+        """
         B, H, W = x.shape
-        x = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
-        magnitude = torch.abs(x)
-        # normalized_magnitude = magnitude / magnitude.max()
-        magnitude = magnitude.reshape(B, H, -1, self.num_blocks, self.block_size)
-        adap_freq = torch.pow(magnitude, self.alpha)
+        x = x.float()
 
-        x = x.reshape(B, x.shape[1], x.shape[2], self.num_blocks, self.block_size)
+        # 2D FFT
+        x_fft = torch.fft.rfft2(x, dim=(1, 2), norm='ortho')  # (B, H, W//2 + 1)
+        orig_freq_dim = x_fft.shape[-1]  # W//2 + 1 = 129
 
-        o1_real = torch.zeros([B, x.shape[1], x.shape[2], self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-        o1_imag = torch.zeros([B, x.shape[1], x.shape[2], self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-        o2_real = torch.zeros(x.shape, device=x.device)
-        o2_imag = torch.zeros(x.shape, device=x.device)
+        # Hard thresholding
+        H_cut = int(H * self.hard_thresholding_fraction)
+        W_cut = int((W // 2 + 1) * self.hard_thresholding_fraction)
+        x_fft = x_fft[:, :H_cut, :W_cut]
 
-        total_modes = (H*W) // 2 + 1
-        kept_modes = int(total_modes * self.hard_thresholding_fraction)
+        # Magnitude-based adaptive weighting (Normalization)
+        magnitude = torch.abs(x_fft)
+        magnitude_max = magnitude.amax(dim=(1, 2), keepdim=True).clamp(min=1e-8)
+        normalized_magnitude = magnitude / magnitude_max
+        
+        # Padding & reshape
+        freq_dim = x_fft.shape[-1]
+        total_size = self.num_blocks * self.block_size
+        if freq_dim < total_size:
+            pad = total_size - freq_dim
+            x_fft = F.pad(x_fft, (0, pad))
+            normalized_magnitude = F.pad(normalized_magnitude, (0, pad))
+            freq_dim = total_size
 
-        o1_real[:, :, :kept_modes] = F.relu(
-            (1+ adap_freq * self.gamma[0] ) *torch.einsum('...bi,bio->...bo', x[:, :, :kept_modes].real, self.w1[0]) - \
-            (1+ adap_freq * self.gamma[0] ) *torch.einsum('...bi,bio->...bo', x[:, :, :kept_modes].imag, self.w1[1]) + \
-            self.b1[0]
-        )
+        # reshape: (B, H_cut, num_blocks, block_size)
+        x_fft = x_fft.reshape(B, H_cut, self.num_blocks, self.block_size)
+        normalized_magnitude = normalized_magnitude.reshape(B, H_cut, self.num_blocks, self.block_size)
+    
+        # Adaptive frequency weighting
+        adap_freq = torch.pow(normalized_magnitude, self.alpha) * self.gamma
 
-        o1_imag[:, :, :kept_modes] = F.relu(
-            (1+ adap_freq * self.gamma[0] ) *torch.einsum('...bi,bio->...bo', x[:, :, :kept_modes].imag, self.w1[0]) + \
-            (1+ adap_freq * self.gamma[0] ) *torch.einsum('...bi,bio->...bo', x[:, :, :kept_modes].real, self.w1[1]) + \
-            self.b1[1]
-        )
+        xr, xi = x_fft.real, x_fft.imag
 
-        o2_real[:, :, :kept_modes] = (
-            (1+ adap_freq * self.gamma[1] ) * torch.einsum('...bi,bio->...bo', o1_real[:, :, :kept_modes], self.w2[0]) - \
-            (1+ adap_freq * self.gamma[1] ) *torch.einsum('...bi,bio->...bo', o1_imag[:, :, :kept_modes], self.w2[1]) + \
-            self.b2[0]
-        )
+        # Adaptive blockwise transform
+        yr = (1 + adap_freq) * torch.einsum('bhni,nio->bhno', xr, self.w_real) - \
+             (1 + adap_freq) * torch.einsum('bhni,nio->bhno', xi, self.w_imag) + self.b_real
+        
+        yi = (1 + adap_freq) * torch.einsum('bhni,nio->bhno', xi, self.w_real) + \
+             (1 + adap_freq) * torch.einsum('bhni,nio->bhno', xr, self.w_imag) + self.b_imag
 
-        o2_imag[:, :, :kept_modes] = (
-            (1+ adap_freq * self.gamma[1] ) *torch.einsum('...bi,bio->...bo', o1_imag[:, :, :kept_modes], self.w2[0]) + \
-            (1+ adap_freq * self.gamma[1] ) *torch.einsum('...bi,bio->...bo', o1_real[:, :, :kept_modes], self.w2[1]) + \
-            self.b2[1]
-        )
+        # softshrink for sparsity
+        yr = F.softshrink(yr, self.sparsity_threshold)
+        yi = F.softshrink(yi, self.sparsity_threshold)
 
-        x = torch.stack([o2_real, o2_imag], dim=-1)
-        x = F.softshrink(x, lambd=self.sparsity_threshold)
-        x = torch.view_as_complex(x)
-        return x
+        y = torch.complex(yr, yi)
+        y = y.reshape(B, H_cut, -1)
+    
+        # resize to original frequency dimension
+        if H_cut < H:
+            y = F.pad(y, (0, 0, 0, H - H_cut))
+        y = y[:, :, :orig_freq_dim]
+
+        return y
     
 
-class Fourier():
+class Fourier(nn.Module):
     def __init__(self, lowpass=True):
+        super().__init__()
         self.lowpass = lowpass
     
     def extract_features(self, x):
