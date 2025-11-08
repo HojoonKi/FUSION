@@ -1,114 +1,180 @@
-# Fast-DDPM
+# Fast-DDPM with Fourier Feature Extraction
 
-Official PyTorch implementation of: 
+This repository implements Fast-DDPM (Fast Denoising Diffusion Probabilistic Models) with Fourier feature extraction for medical image processing tasks including image translation, CT denoising, and super-resolution.
 
-[Fast-DDPM: Fast Denoising Diffusion Probabilistic Models for Medical Image-to-Image Generation](https://ieeexplore.ieee.org/abstract/document/10979336) (JBHI 2025)
+## Overview
 
-We propose Fast-DDPM, a simple yet effective approach that improves training speed, sampling speed, and generation quality of diffusion models simultaneously. Fast-DDPM trains and samples using only 10 time steps, reducing the training time to 0.2x and the sampling time to 0.01x compared to DDPM.
+The project extends the Fast-DDPM framework by incorporating Fourier-based feature extraction into the diffusion model architecture. This enhancement enables better frequency-domain processing of medical images.
 
-<p align="center">
-  <img src="Overview.png" alt="DDPM vs. Fast-DDPM" width="750">
-</p>
+### Key Features
 
-The code is only for research purposes. If you have any questions regarding how to use this code, feel free to contact Hongxu Jiang (hongxu.jiang@medicine.ufl.edu).
+- **Fast-DDPM Training**: Accelerated DDPM training with uniform and non-uniform scheduler sampling
+- **Fourier Feature Extraction**: Integrated Fourier transform-based feature extraction in the model forward pass
+- **Multiple Tasks Support**:
+  - `sg` (Segmentation): Image translation and CT denoising with single condition input
+  - `sr` (Super-Resolution): Multi-frame image super-resolution with dual condition input
+- **Flexible Scheduler**: Support for uniform and non-uniform timestep sampling strategies
+- **Test Mode**: Dummy data forward pass for model testing and debugging
 
-## Requirements
-* Python==3.10.6
-* torch==1.12.1
-* torchvision==0.15.2
-* numpy
-* opencv-python
-* tqdm
-* tensorboard
-* tensorboardX
-* scikit-image
-* medpy
-* pillow
-* scipy
-* `pip install -r requirements.txt`
+## Architecture
 
-## Publicly available Dataset
-- Prostate-MRI-US-Biopsy dataset
-- LDCT-and-Projection-data dataset
-- BraTS 2018 dataset
-- The processed dataset can be accessed here: https://drive.google.com/file/d/1kF0g8fMR5XPQ2FTbutfTQ-hwG_mTqerx/view?usp=drive_link.
+### Model Types
+
+- **sg (Segmentation)**: `in_channels=2` (x_img + x_noisy)
+  - Used for: BRATS (brain image translation), LDFDCT (CT denoising)
+- **sr (Super-Resolution)**: `in_channels=3` (x_bw + x_fw + x_noisy)
+  - Used for: PMUB (multi-frame super-resolution)
+  - Frame notation: BW (backward), MD (middle), FW (forward)
+
+### Fourier Integration
+
+The `models/fourier.py` module provides two implementations:
+
+1. **Fourier Class**: Traditional lowpass/highpass filtering
+   - `lowpass_filter()`: Applies frequency-domain lowpass filtering
+   - `extract_features()`: Extracts frequency-domain features via FFT
+
+2. **LearnableFourier Module**: Learnable frequency-domain transformations
+   - Block-diagonal weight matrices for efficient computation
+   - Adaptive frequency weighting with learnable parameters
+   - Sparsity control via soft-thresholding
+
+The Fourier features are extracted in `models/diffusion.py` during the forward pass:
+
+```python
+x_orig = tmp[:, :1].squeeze(1)  # Extract condition image (B, H, W)
+ff = self.Fourier.forward(x_orig)  # Apply Fourier transform (B, H, W//2+1)
+```
+
+## Installation
+
+### Requirements
+
+- Python 3.10
+- CUDA-capable GPU (recommended)
+
+### Setup
+
+1. Clone the repository:
+```bash
+git clone https://github.com/mirthAI/Fast-DDPM.git
+cd Fast-DDPM
+```
+
+2. Create a conda environment (recommended):
+```bash
+conda create -n fusion python=3.10
+conda activate fusion
+```
+
+3. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+**Note**: The requirements include:
+- PyTorch 2.0.1 with torchvision 0.15.2
+- NumPy < 2.0 (for compatibility)
+- OpenCV 4.8.1.78
+- Additional packages: tensorboard, scikit-image, medpy, PyYAML, lmdb
 
 ## Usage
-### 1. Git clone or download the codes.
 
-### 2. Pretrained model weights
-* We provide pretrained model weights for all three tasks, where you can access them here: https://drive.google.com/file/d/1ndS-eLegqwCOUoLT1B-HQiqRQqZUMKVF/view?usp=sharing.
-* Pretrained model weights are also available on [Hugging Face](https://huggingface.co/SebastianJiang/FastDDPM).
-* As shown in ablation study, the defaulted 10 time steps may not be optimal for every task, you're more welcome to train Fast-DDPM model on your dataset using different settings.
+### Training
 
-### 3. Prepare data
-* Please download our processed dataset or download from the official websites.
-* After downloading, extract the file and put it into folder "data/". The directory structure should be as follows:
+Train Fast-DDPM on different datasets:
+
+**LDFDCT (CT Denoising)**:
+```bash
+python fast_ddpm_main.py --config configs/ldfd_linear.yml --dataset LDFDCT --scheduler_type uniform --timesteps 10
+```
+
+**BRATS (Brain Image Translation)**:
+```bash
+python fast_ddpm_main.py --config configs/brats_linear.yml --dataset BRATS --scheduler_type non-uniform --timesteps 10
+```
+
+**PMUB (Super-Resolution)**:
+```bash
+python fast_ddpm_main.py --config configs/pmub_linear.yml --dataset PMUB --scheduler_type uniform --timesteps 10
+```
+
+### Testing with Dummy Data
+
+Test the model forward pass with random dummy data (256×256):
 
 ```bash
-├── configs
-│
-├── data
-│	├── LD_FD_CT_train
-│	├── LD_FD_CT_test
-│	├── PMUB-train
-│	├── PMUB-test
-│	├── Brats_train
-│	└── Brats_test
-│
-├── datasets
-│
-├── functions
-│
-├── models
-│
-└── runners
-
+python fast_ddpm_main.py --test --config configs/ldfd_linear.yml
 ```
 
-### 4. Training/Sampling a Fast-DDPM model
-* Please make sure that the hyperparameters such as scheduler type and timesteps are consistent between training and sampling.
-* The total number of time steps is defaulted as 1000 in the paper, so the number of involved time steps for Fast-DDPM should be less than 1000 as an integer.
-```
-python fast_ddpm_main.py --config {DATASET}.yml --dataset {DATASET_NAME} --exp {PROJECT_PATH} --doc {MODEL_NAME} --scheduler_type {SAMPLING STRATEGY} --timesteps {STEPS}
-```
-```
-python fast_ddpm_main.py --config {DATASET}.yml --dataset {DATASET_NAME} --exp {PROJECT_PATH} --doc {MODEL_NAME} --sample --fid --scheduler_type {SAMPLING STRATEGY} --timesteps {STEPS}
+This mode:
+- Skips checkpoint loading
+- Creates random input tensors (B=1, C=channels, H=256, W=256)
+- Performs a single forward pass through the model
+- Prints tensor shapes for debugging
+
+### Sampling
+
+Generate samples from trained checkpoints:
+
+```bash
+python fast_ddpm_main.py --sample --fid --config configs/ldfd_linear.yml --dataset LDFDCT
 ```
 
-where 
-- `DATASET_NAME` should be selected among `LDFDCT` for image denoising task, `BRATS` for image-to-image translation task and `PMUB` for multi image super-resolution task.
-- `SAMPLING STRATEGY` controls the scheduler sampling strategy proposed in the paper (either uniform or non-uniform).
-- `STEPS` controls how many timesteps used in the training and inference process. It should be an integer less than 1000 for Fast-DDPM, which is 10 by default.
+## Configuration
 
+Configuration files are located in `configs/`:
 
-### 5. Training/Sampling a DDPM model
-* Please make sure that the hyperparameters such as scheduler type and timesteps are consistent between training and sampling.
-* The total number of time steps is defaulted as 1000 in the paper, so the number of time steps for DDPM is defaulted as 1000.
+- `ldfd_linear.yml`: LDFDCT dataset with linear beta schedule
+- `brats_linear.yml`: BRATS dataset with linear beta schedule  
+- `pmub_linear.yml`: PMUB dataset with linear beta schedule
+
+Key parameters:
+- `model.type`: `sg` or `sr`
+- `model.in_channels`: 2 for sg, 3 for sr
+- `diffusion.beta_schedule`: `linear`, `quad`, `sigmoid`, `alpha_cosine`, etc.
+- `training.batch_size`: Training batch size
+- `sampling.ckpt_id`: List of checkpoint steps for inference
+
+## Project Structure
+
 ```
-python ddpm_main.py --config {DATASET}.yml --dataset {DATASET_NAME} --exp {PROJECT_PATH} --doc {MODEL_NAME} --timesteps {STEPS}
+FUSION/
+├── configs/                # Configuration files
+├── datasets/              # Dataset loaders (BRATS, LDFDCT, PMUB)
+├── functions/             # Loss functions and utilities
+├── models/
+│   ├── diffusion.py      # Main U-Net diffusion model with Fourier integration
+│   ├── fourier.py        # Fourier feature extraction modules
+│   └── ema.py            # Exponential Moving Average helper
+├── runners/
+│   └── diffusion.py      # Training and sampling runners
+├── fast_ddpm_main.py     # Main entry point
+├── ddpm_main.py          # Original DDPM implementation
+└── requirements.txt      # Python dependencies
 ```
-```
-python ddpm_main.py --config {DATASET}.yml --dataset {DATASET_NAME} --exp {PROJECT_PATH} --doc {MODEL_NAME} --sample --fid --timesteps {STEPS}
-```
 
-where 
-- `DATASET_NAME` should be selected among `LDFDCT` for image denoising task, `BRATS` for image-to-image translation task and `PMUB` for multi image super-resolution task.
-- `STEPS` controls how many timesteps used in the training and inference process. It should be 1000 in the setting of this paper.
+## Training Methods
 
+- `sg_train()`: Fast-DDPM training for single-condition tasks
+- `sg_ddpm_train()`: Original DDPM training for single-condition tasks
+- `sr_train()`: Fast-DDPM training for dual-condition super-resolution
+- `sr_ddpm_train()`: Original DDPM training for dual-condition super-resolution
 
-## References
-* The code is mainly adapted from [DDIM](https://github.com/ermongroup/ddim).
+### Scheduler Types
 
+- **uniform**: Evenly spaced timesteps across [0, T]
+- **non-uniform**: Quadratically spaced timesteps for better sampling quality
 
-## Citations
-If you use our code or dataset, please cite our paper as below:
-```bibtex
-@article{jiang2025fast,
-  title={Fast-DDPM: Fast denoising diffusion probabilistic models for medical image-to-image generation},
-  author={Jiang, Hongxu and Imran, Muhammad and Zhang, Teng and Zhou, Yuyin and Liang, Muxuan and Gong, Kuang and Shao, Wei},
-  journal={IEEE Journal of Biomedical and Health Informatics},
-  year={2025},
-  publisher={IEEE}
-}
-```
+## Sampling Strategies
+
+- **generalized**: Generalized DDIM sampling with eta parameter
+- **ddpm_noisy**: Standard DDPM sampling with all noise steps
+
+## License
+
+See `LICENSE` file for details.
+
+## Acknowledgements
+
+This implementation builds upon the DDPM and DDIM frameworks for diffusion models, adapted for medical imaging applications with Fourier domain enhancements.

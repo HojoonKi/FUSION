@@ -1,8 +1,8 @@
 import math
 import torch
 import torch.nn as nn
-
-
+from .fourier import LearnableFourier, Fourier
+ 
 def get_timestep_embedding(timesteps, embedding_dim):
     """
     This matches the implementation in Denoising Diffusion Probabilistic Models:
@@ -297,9 +297,16 @@ class Model(nn.Module):
                                         kernel_size=3,
                                         stride=1,
                                         padding=1)
+        
+        self.Fourier = Fourier(lowpass=True)
 
     def forward(self, x, t):
         assert x.shape[2] == x.shape[3] == self.resolution
+
+        # Fourier feature extraction
+        tmp = x.clone()
+        x_orig = tmp[:, :1].squeeze(1)  # B,H,W
+        ff = self.Fourier.forward(x_orig) # B, H, W/2+1
 
         # timestep embedding
         temb = get_timestep_embedding(t, self.ch)
@@ -308,7 +315,7 @@ class Model(nn.Module):
         temb = self.temb.dense[1](temb)
 
         # downsampling
-        hs = [self.conv_in(x)]
+        hs = [self.conv_in(x)] # when H, W = 256, hs[-1]: B, 128, 256, 256
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
                 h = self.down[i_level].block[i_block](hs[-1], temb)

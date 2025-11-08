@@ -4,7 +4,6 @@ import time
 import glob
 
 import numpy as np
-import pandas as pd
 import math
 import tqdm
 import torch
@@ -933,4 +932,37 @@ class Diffusion(object):
 
 
     def test(self):
-        pass
+        ckpt_list = self.config.sampling.ckpt_id
+        for ckpt_idx in ckpt_list:
+            self.ckpt_idx = ckpt_idx
+            model = Model(self.config)
+            print('Start inference on model of {} steps'.format(ckpt_idx))
+
+            model = model.to(self.device)
+            model = torch.nn.DataParallel(model)
+
+            model.eval()
+
+            with torch.no_grad():
+                batch_size = 1
+                channels = self.config.data.channels
+                image_size = 256  # LDFD dataset
+                t = torch.randint(0, self.num_timesteps, (batch_size,), device=self.device).float()
+
+                if self.config.model.type == 'sg':
+                    # sg: in_channels=2 (x_img + x_noisy)
+                    x_noisy = torch.randn(batch_size, channels, image_size, image_size, device=self.device)
+                    x_img = torch.randn(batch_size, 1, image_size, image_size, device=self.device)
+                    input_tensor = torch.cat([x_img, x_noisy], dim=1)
+                elif self.config.model.type == 'sr':
+                    # sr: in_channels=3 (x_bw, x_fw, x_noisy)
+                    x_noisy = torch.randn(batch_size, channels, image_size, image_size, device=self.device)
+                    x_bw = torch.randn(batch_size, 1, image_size, image_size, device=self.device)
+                    x_fw = torch.randn(batch_size, 1, image_size, image_size, device=self.device)
+                    input_tensor = torch.cat([x_bw, x_fw, x_noisy], dim=1)
+                else:
+                    raise ValueError("Unsupported model type")
+
+                output = model(input_tensor, t)
+                print(f"Forward pass successful for ckpt {ckpt_idx}. Output shape: {output.shape}")
+        

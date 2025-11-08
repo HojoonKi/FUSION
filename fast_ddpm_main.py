@@ -18,10 +18,10 @@ def parse_args_and_config():
     parser = argparse.ArgumentParser(description=globals()["__doc__"])
 
     parser.add_argument(
-        "--config", type=str, default="pmub_linear.yml", help="Path to the config file"
+        "--config", type=str, default="ldfd_linear.yml", help="Path to the config file"
     )
     parser.add_argument(
-        "--dataset", type=str, default="PMUB", help="Name of dataset(LDFDCT, BRATS, PMUB)"
+        "--dataset", type=str, default="LDFDCT", help="Name of dataset(LDFDCT, BRATS, PMUB)"
     )
     parser.add_argument("--seed", type=int, default=1244, help="Random seed")
     parser.add_argument(
