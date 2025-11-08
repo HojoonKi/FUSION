@@ -57,7 +57,7 @@ ff = self.Fourier.forward(x_orig)  # Apply Fourier transform (B, H, W//2+1)
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/mirthAI/Fast-DDPM.git
+git clone https://github.com/HojoonKi/FUSION.git
 cd Fast-DDPM
 ```
 
