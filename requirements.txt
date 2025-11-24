@@ -12,3 +12,4 @@ scipy
 PyYAML
 lmdb
 matplotlib
+datasets==4.4.1

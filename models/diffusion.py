@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .fourier import LearnableFourier, Fourier
  
 def get_timestep_embedding(timesteps, embedding_dim):
@@ -189,6 +190,58 @@ class AttnBlock(nn.Module):
         return x+h_
 
 
+class FrequencyGuidedCrossAttention(nn.Module):
+    def __init__(self, channels, heads=4, max_tokens=1024):
+        super().__init__()
+        self.channels = channels
+        self.heads = heads
+        self.max_tokens = max_tokens
+        self.query_norm = Normalize(channels)
+        self.prior_proj = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=3, padding=1),
+            Normalize(channels),
+            nn.SiLU(),
+        )
+        self.attn = nn.MultiheadAttention(embed_dim=channels,
+                                          num_heads=heads,
+                                          batch_first=True)
+        self.out_proj = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.SiLU(),
+            nn.Linear(channels, channels),
+        )
+
+    def forward(self, x, prior_map):
+        """
+        x: (B, C, H, W), prior_map: (B, 1, H0, W0)
+        """
+        B, C, H, W = x.shape
+        # normalize queries for stability
+        q = self.query_norm(x)
+        prior_aligned = F.interpolate(prior_map, size=(H, W), mode="bilinear", align_corners=False)
+        kv = self.prior_proj(prior_aligned)
+
+        q_reduced, (H_r, W_r) = self._reduce_tokens(q, H, W)
+        kv_reduced, _ = self._reduce_tokens(kv, H, W)
+
+        q_seq = q_reduced.flatten(2).transpose(1, 2)       # (B, HW, C)
+        kv_seq = kv_reduced.flatten(2).transpose(1, 2)     # (B, HW, C)
+
+        attn_out, _ = self.attn(q_seq, kv_seq, kv_seq)
+        attn_out = self.out_proj(attn_out)
+        attn_out = attn_out.transpose(1, 2).reshape(B, C, H_r, W_r)
+        attn_out = F.interpolate(attn_out, size=(H, W), mode="bilinear", align_corners=False)
+        return x + attn_out
+
+    def _reduce_tokens(self, tensor, H, W):
+        total_tokens = H * W
+        if total_tokens <= self.max_tokens:
+            return tensor, (H, W)
+        target_hw = int(math.sqrt(self.max_tokens))
+        pooled = F.adaptive_avg_pool2d(tensor, (target_hw, target_hw))
+        return pooled, (target_hw, target_hw)
+
+
 class Model(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -201,6 +254,9 @@ class Model(nn.Module):
         resolution = config.data.image_size
         resamp_with_conv = config.model.resamp_with_conv
         num_timesteps = config.diffusion.num_diffusion_timesteps
+        self.use_freq_cross_attn = getattr(config.model, "use_freq_cross_attn", False)
+        self.freq_cross_attn_heads = getattr(config.model, "freq_cross_attn_heads", 4)
+        self.use_fourier_features = getattr(config.model, "use_fourier_features", True)
         
         if config.model.type == 'bayesian':
             self.logvar = nn.Parameter(torch.zeros(num_timesteps))
@@ -267,6 +323,10 @@ class Model(nn.Module):
 
         # upsampling
         self.up = nn.ModuleList()
+        if self.use_freq_cross_attn:
+            self.cross_attn = nn.ModuleList()
+        else:
+            self.cross_attn = None
         for i_level in reversed(range(self.num_resolutions)):
             block = nn.ModuleList()
             attn = nn.ModuleList()
@@ -289,6 +349,8 @@ class Model(nn.Module):
                 up.upsample = Upsample(block_in, resamp_with_conv)
                 curr_res = curr_res * 2
             self.up.insert(0, up)  # prepend to get consistent order
+            if self.use_freq_cross_attn and self.use_fourier_features:
+                self.cross_attn.insert(0, FrequencyGuidedCrossAttention(block_in, heads=self.freq_cross_attn_heads))
 
         # end
         self.norm_out = Normalize(block_in)
@@ -298,16 +360,23 @@ class Model(nn.Module):
                                         stride=1,
                                         padding=1)
         
-        # self.Fourier = Fourier(lowpass=True)
-        self.Fourier = LearnableFourier(hidden_size=512) # choose beetween Fourier or LearnableFourier
+        if self.use_fourier_features:
+            # self.Fourier = Fourier(lowpass=True)
+            self.Fourier = LearnableFourier(hidden_size=512) # choose between Fourier or LearnableFourier
+        else:
+            self.Fourier = None
 
     def forward(self, x, t):
         assert x.shape[2] == x.shape[3] == self.resolution
 
-        # Fourier feature extraction
-        tmp = x.clone()
-        x_orig = tmp[:, :1].squeeze(1)  # B,H,W
-        ff = self.Fourier(x_orig) # B, H, W//2+1
+        structural_prior = None
+        if self.use_fourier_features:
+            # Fourier feature extraction
+            tmp = x.clone()
+            x_orig = tmp[:, :1].squeeze(1)  # B,H,W
+            ff = self.Fourier(x_orig) # B, H, W//2+1
+            if self.use_freq_cross_attn:
+                structural_prior = self._build_structural_prior(ff, x_orig.shape[-2:])
 
         # timestep embedding
         temb = get_timestep_embedding(t, self.ch)
@@ -340,6 +409,8 @@ class Model(nn.Module):
                     torch.cat([h, hs.pop()], dim=1), temb)
                 if len(self.up[i_level].attn) > 0:
                     h = self.up[i_level].attn[i_block](h)
+            if self.use_freq_cross_attn and self.use_fourier_features:
+                h = self.cross_attn[i_level](h, structural_prior)
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
 
@@ -348,3 +419,17 @@ class Model(nn.Module):
         h = nonlinearity(h)
         h = self.conv_out(h)
         return h
+
+    def _build_structural_prior(self, freq_repr, spatial_shape):
+        """
+        freq_repr: complex tensor (B, H, W//2+1)
+        spatial_shape: tuple (H, W)
+        returns: normalized structural prior (B, 1, H, W)
+        """
+        prior = torch.fft.irfft2(freq_repr, s=spatial_shape)
+        prior = prior.unsqueeze(1)
+        mean = prior.mean(dim=(2, 3), keepdim=True)
+        std = prior.std(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+        prior = (prior - mean) / std
+        prior = torch.tanh(prior)
+        return prior

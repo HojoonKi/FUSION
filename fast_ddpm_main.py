@@ -89,6 +89,64 @@ def parse_args_and_config():
         help="eta used to control the variances of sigma",
     )
     parser.add_argument("--sequence", action="store_true")
+    parser.add_argument(
+        "--disable_freq_cross_attn",
+        action="store_true",
+        help="Turn off frequency-guided cross-attention blocks to match checkpoints trained without them",
+    )
+    parser.add_argument(
+        "--disable_fourier_features",
+        action="store_true",
+        help="Disable Fourier/LearnableFourier modules for compatibility with classic Fast-DDPM checkpoints",
+    )
+    parser.add_argument(
+        "--train_stage",
+        type=str,
+        default="full",
+        choices=["full", "freq_only"],
+        help="Select training stage: 'freq_only' freezes base U-Net and trains only Fourier/cross-attn modules first",
+    )
+    parser.add_argument(
+        "--init_ckpt",
+        type=str,
+        default="",
+        help="Path to an initial checkpoint (.pth) whose model weights are loaded before training",
+    )
+    parser.add_argument(
+        "--preview_freq",
+        type=int,
+        default=0,
+        help="Step interval to run preview sampling (0 disables)",
+    )
+    parser.add_argument(
+        "--preview_count",
+        type=int,
+        default=10,
+        help="Number of preview samples saved when preview sampling runs",
+    )
+    parser.add_argument(
+        "--preview_batch_size",
+        type=int,
+        default=2,
+        help="Batch size for preview sampling dataloader",
+    )
+    parser.add_argument(
+        "--preview_dir",
+        type=str,
+        default="preview",
+        help="Subdirectory under exp/ to place preview outputs",
+    )
+    parser.add_argument(
+        "--ckpt_id",
+        type=str,
+        default="",
+        help="Override sampling.ckpt_id with a comma-separated list (supports ints or custom tags like LDFDCT)",
+    )
+    parser.add_argument(
+        "--skip_ema",
+        action="store_true",
+        help="Skip loading/using EMA weights during sampling/testing",
+    )
 
     args = parser.parse_args()
     args.log_path = os.path.join(args.exp, "logs", args.doc)
@@ -97,6 +155,26 @@ def parse_args_and_config():
     with open(os.path.join("configs", args.config), "r") as f:
         config = yaml.safe_load(f)
     new_config = dict2namespace(config)
+
+    if args.disable_freq_cross_attn and hasattr(new_config, "model"):
+        if hasattr(new_config.model, "use_freq_cross_attn"):
+            setattr(new_config.model, "use_freq_cross_attn", False)
+    if args.ckpt_id:
+        override = []
+        for token in args.ckpt_id.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                override.append(int(token))
+            except ValueError:
+                override.append(token)
+        if hasattr(new_config, "sampling"):
+            setattr(new_config.sampling, "ckpt_id", override)
+    if args.disable_fourier_features and hasattr(new_config, "model"):
+        setattr(new_config.model, "use_fourier_features", False)
+    if args.skip_ema and hasattr(new_config, "model"):
+        setattr(new_config.model, "ema", False)
 
     tb_path = os.path.join(args.exp, "tensorboard", args.doc)
 

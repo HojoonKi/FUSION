@@ -1,0 +1,42 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*.so
+
+# Jupyter artifacts
+.ipynb_checkpoints/
+
+# Virtual environments and editor settings
+.env
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+
+# Logs and debug output
+*.log
+logs/
+
+# Experiment runs and tensorboard outputs
+exp/
+exp_stage1/
+pretrained/logs/
+pretrained/image_samples/
+pretrained/tensorboard/
+pretrained/preview/
+pretrained/pretrained_models/
+
+# Data and checkpoints
+data/
+ct_denoise_train.zip
+ct_denoise_test.zip
+pretrained/pretrained_models.zip
+*.pt
+*.pth
+*.ckpt
+*.png
+
+# Miscellaneous system files
+.DS_Store
+Thumbs.db

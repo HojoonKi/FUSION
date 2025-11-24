@@ -13,10 +13,10 @@ from models.diffusion import Model
 from models.ema import EMAHelper
 from functions import get_optimizer
 from functions.losses import loss_registry, calculate_psnr
-from datasets import data_transform, inverse_data_transform
-from datasets.pmub import PMUB
-from datasets.LDFDCT import LDFDCT
-from datasets.BRATS import BRATS
+from fusion_datasets import data_transform, inverse_data_transform
+from fusion_datasets.pmub import PMUB
+from fusion_datasets.LDFDCT import LDFDCT
+from fusion_datasets.BRATS import BRATS
 from functions.ckpt_util import get_ckpt_path
 from skimage.metrics import structural_similarity as ssim
 import torchvision.utils as tvu
@@ -91,6 +91,7 @@ class Diffusion(object):
                 else torch.device("cpu")
             )
         self.device = device
+        self.preview_loader = None
 
         self.model_var_type = config.model.var_type
         betas = get_beta_schedule(
@@ -115,6 +116,169 @@ class Diffusion(object):
         elif self.model_var_type == "fixedsmall":
             self.logvar = posterior_variance.clamp(min=1e-20).log()
 
+    def _get_ldfdct_kwargs(self):
+        return {
+            "hu_min": getattr(self.config.data, "hu_min", -1024.0),
+            "hu_max": getattr(self.config.data, "hu_max", 1500.0),
+        }
+
+    def _get_ldfdct_length(self, attr):
+        value = getattr(self.config.data, attr, -1)
+        if value is None or value <= 0:
+            return -1
+        return int(value)
+
+    def _apply_training_stage(self, model):
+        stage = getattr(self.args, "train_stage", "full")
+        if stage != "freq_only":
+            return
+        logging.info("Training stage 'freq_only': freezing base parameters and enabling Fourier/cross-attn modules only.")
+        for p in model.parameters():
+            p.requires_grad = False
+
+        unfrozen = 0
+        fourier = getattr(model, "Fourier", None)
+        if fourier is not None:
+            for p in fourier.parameters():
+                p.requires_grad = True
+                unfrozen += 1
+        cross_attn = getattr(model, "cross_attn", None)
+        if cross_attn is not None:
+            for module in cross_attn:
+                for p in module.parameters():
+                    p.requires_grad = True
+                    unfrozen += 1
+        if unfrozen == 0:
+            logging.warning("freq_only stage selected but no Fourier/cross-attention parameters were unfrozen.")
+
+    def _load_initial_checkpoint(self, model):
+        ckpt_path = getattr(self.args, "init_ckpt", "")
+        if not ckpt_path or self.args.resume_training:
+            return
+        if not os.path.isfile(ckpt_path):
+            logging.warning("init_ckpt path %s not found, skipping warm start.", ckpt_path)
+            return
+        logging.info("Loading initial checkpoint from %s (strict=False).", ckpt_path)
+        states = torch.load(ckpt_path, map_location=self.config.device)
+        if isinstance(states, (list, tuple)):
+            state_dict = states[0]
+        else:
+            state_dict = states
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            missing_preview = list(missing[:8])
+            if len(missing) > 8:
+                missing_preview.append("...")
+            logging.info("Missing keys when loading init_ckpt (expected for new modules): %s", missing_preview)
+        if unexpected:
+            unexpected_preview = list(unexpected[:8])
+            if len(unexpected) > 8:
+                unexpected_preview.append("...")
+            logging.info("Unexpected keys when loading init_ckpt: %s", unexpected_preview)
+
+    def _build_train_model(self):
+        base_model = Model(self.config)
+        self._apply_training_stage(base_model)
+        base_model = base_model.to(self.device)
+        model = torch.nn.DataParallel(base_model)
+        self._load_initial_checkpoint(model)
+        return model
+
+    def _trainable_parameters(self, model):
+        params = [p for p in model.parameters() if p.requires_grad]
+        if len(params) == 0:
+            raise ValueError("No trainable parameters found. Adjust --train_stage or enable relevant modules.")
+        return params
+
+    def _ensure_preview_loader(self):
+        freq = getattr(self.args, "preview_freq", 0)
+        if freq <= 0 or self.preview_loader is not None:
+            return
+        limit = max(0, getattr(self.args, "preview_count", 0))
+        if limit == 0:
+            logging.warning("preview_freq > 0 but preview_count == 0; skipping preview sampling.")
+            return
+        dataset_name = getattr(self.args, "dataset", "")
+        dataset = None
+        if dataset_name == 'LDFDCT':
+            dataset = LDFDCT(
+                self.config.data.sample_dataroot,
+                self.config.data.image_size,
+                split='calculate',
+                data_len=limit,
+                **self._get_ldfdct_kwargs(),
+            )
+        elif dataset_name == 'BRATS':
+            dataset = BRATS(
+                self.config.data.sample_dataroot,
+                self.config.data.image_size,
+                split='calculate',
+                data_len=limit)
+        else:
+            logging.warning("Preview sampling currently supports only LDFDCT/BRATS datasets (got %s).", dataset_name)
+            return
+        if dataset is None:
+            return
+        if limit > 0 and len(dataset) > limit:
+            dataset = data.Subset(dataset, list(range(limit)))
+        batch_size = max(1, getattr(self.args, "preview_batch_size", 1))
+        self.preview_loader = data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0)
+
+    def _run_preview_sampling(self, model, step):
+        freq = getattr(self.args, "preview_freq", 0)
+        if freq <= 0 or step % freq != 0:
+            return
+        self._ensure_preview_loader()
+        if self.preview_loader is None:
+            return
+        preview_root = os.path.join(
+            self.args.exp,
+            getattr(self.args, "preview_dir", "preview"),
+            self.args.doc,
+            f"step_{step}",
+        )
+        os.makedirs(preview_root, exist_ok=True)
+        saved = 0
+        limit = getattr(self.args, "preview_count", 0)
+        model_was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for sample in self.preview_loader:
+                n = sample['LD'].shape[0]
+                x = torch.randn(
+                    n,
+                    self.config.data.channels,
+                    self.config.data.image_size,
+                    self.config.data.image_size,
+                    device=self.device,
+                )
+                x_img = sample['LD'].to(self.device)
+                x_gt = sample['FD'].to(self.device)
+                case_names = sample['case_name']
+                x = self.sg_sample_image(x, x_img, model)
+                x = inverse_data_transform(self.config, x)
+                x_gt = inverse_data_transform(self.config, x_gt)
+                for i in range(n):
+                    tvu.save_image(
+                        x[i],
+                        os.path.join(preview_root, f"{case_names[i]}_{saved:03d}_pt.png"),
+                    )
+                    tvu.save_image(
+                        x_gt[i],
+                        os.path.join(preview_root, f"{case_names[i]}_{saved:03d}_gt.png"),
+                    )
+                    saved += 1
+                    if saved >= limit:
+                        break
+                if saved >= limit:
+                    break
+        if model_was_training:
+            model.train()
+
     
     # Training Fast-DDPM for tasks that have only one condition: image translation and CT denoising.
     def sg_train(self):
@@ -123,7 +287,13 @@ class Diffusion(object):
         
         if self.args.dataset=='LDFDCT':
             # LDFDCT for CT image denoising
-            dataset = LDFDCT(self.config.data.train_dataroot, self.config.data.image_size, split='train')
+            dataset = LDFDCT(
+                self.config.data.train_dataroot,
+                self.config.data.image_size,
+                split='train',
+                data_len=self._get_ldfdct_length("train_data_len"),
+                **self._get_ldfdct_kwargs(),
+            )
             print('Start training your Fast-DDPM model on LDFDCT dataset.')
         elif self.args.dataset=='BRATS':
             # BRATS for brain image translation
@@ -138,11 +308,9 @@ class Diffusion(object):
             num_workers=config.data.num_workers,
             pin_memory=True)
 
-        model = Model(config)
-        model = model.to(self.device)
-        model = torch.nn.DataParallel(model)
+        model = self._build_train_model()
 
-        optimizer = get_optimizer(self.config, model.parameters())
+        optimizer = get_optimizer(self.config, self._trainable_parameters(model))
 
         if self.config.model.ema:
             ema_helper = EMAHelper(mu=self.config.model.ema_rate)
@@ -235,6 +403,10 @@ class Diffusion(object):
                         os.path.join(self.args.log_path, "ckpt_{}.pth".format(step)),
                     )
                     torch.save(states, os.path.join(self.args.log_path, "ckpt.pth"))
+
+                self._run_preview_sampling(model, step)
+
+                self._run_preview_sampling(model, step)
                     
 
     # Training Fast-DDPM for tasks that have two conditions: multi image super-resolution.
@@ -252,11 +424,9 @@ class Diffusion(object):
             num_workers=config.data.num_workers,
             pin_memory=True)
 
-        model = Model(config)
-        model = model.to(self.device)
-        model = torch.nn.DataParallel(model)
+        model = self._build_train_model()
 
-        optimizer = get_optimizer(self.config, model.parameters())
+        optimizer = get_optimizer(self.config, self._trainable_parameters(model))
 
         if self.config.model.ema:
             ema_helper = EMAHelper(mu=self.config.model.ema_rate)
@@ -359,7 +529,13 @@ class Diffusion(object):
 
         if self.args.dataset=='LDFDCT':
             # LDFDCT for CT image denoising
-            dataset = LDFDCT(self.config.data.train_dataroot, self.config.data.image_size, split='train')
+            dataset = LDFDCT(
+                self.config.data.train_dataroot,
+                self.config.data.image_size,
+                split='train',
+                data_len=self._get_ldfdct_length("train_data_len"),
+                **self._get_ldfdct_kwargs(),
+            )
             print('Start training DDPM model on LDFDCT dataset.')
         elif self.args.dataset=='BRATS':
             # BRATS for brain image translation
@@ -374,11 +550,9 @@ class Diffusion(object):
             num_workers=config.data.num_workers,
             pin_memory=True)
 
-        model = Model(config)
-        model = model.to(self.device)
-        model = torch.nn.DataParallel(model)
+        model = self._build_train_model()
 
-        optimizer = get_optimizer(self.config, model.parameters())
+        optimizer = get_optimizer(self.config, self._trainable_parameters(model))
 
         if self.config.model.ema:
             ema_helper = EMAHelper(mu=self.config.model.ema_rate)
@@ -470,11 +644,9 @@ class Diffusion(object):
             num_workers=config.data.num_workers,
             pin_memory=True)
 
-        model = Model(config)
-        model = model.to(self.device)
-        model = torch.nn.DataParallel(model)
+        model = self._build_train_model()
 
-        optimizer = get_optimizer(self.config, model.parameters())
+        optimizer = get_optimizer(self.config, self._trainable_parameters(model))
 
         if self.config.model.ema:
             ema_helper = EMAHelper(mu=self.config.model.ema_rate)
@@ -570,7 +742,8 @@ class Diffusion(object):
                 )
                 model = model.to(self.device)
                 model = torch.nn.DataParallel(model)
-                model.load_state_dict(states[0], strict=True)
+                load_strict = not (getattr(self.args, "disable_freq_cross_attn", False) or getattr(self.args, "disable_fourier_features", False) or getattr(self.args, "skip_ema", False))
+                model.load_state_dict(states[0], strict=load_strict)
 
                 if self.config.model.ema:
                     ema_helper = EMAHelper(mu=self.config.model.ema_rate)
@@ -622,7 +795,12 @@ class Diffusion(object):
                 )
                 model = model.to(self.device)
                 model = torch.nn.DataParallel(model)
-                model.load_state_dict(states[0], strict=True)
+                load_strict = not (
+                    getattr(self.args, "disable_freq_cross_attn", False)
+                    or getattr(self.args, "disable_fourier_features", False)
+                    or getattr(self.args, "skip_ema", False)
+                )
+                model.load_state_dict(states[0], strict=load_strict)
 
                 if self.config.model.ema:
                     ema_helper = EMAHelper(mu=self.config.model.ema_rate)
@@ -754,7 +932,13 @@ class Diffusion(object):
 
         if self.args.dataset=='LDFDCT':
             # LDFDCT for CT image denoising
-            sample_dataset = LDFDCT(self.config.data.sample_dataroot, self.config.data.image_size, split='calculate')
+            sample_dataset = LDFDCT(
+                self.config.data.sample_dataroot,
+                self.config.data.image_size,
+                split='calculate',
+                data_len=self._get_ldfdct_length("sample_data_len"),
+                **self._get_ldfdct_kwargs(),
+            )
             print('Start training model on LDFDCT dataset.')
         elif self.args.dataset=='BRATS':
             # BRATS for brain image translation

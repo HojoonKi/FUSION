@@ -1,0 +1,67 @@
+data:
+    dataset: "LDFDCT"
+    train_dataroot: "data/content/drive/MyDrive/AI604 Deep Learning for Computer Vision/Project/data/ct_denoise_train"
+    val_dataroot: "data/content/drive/MyDrive/AI604 Deep Learning for Computer Vision/Project/data/ct_denoise_test"
+    sample_dataroot: "data/content/drive/MyDrive/AI604 Deep Learning for Computer Vision/Project/data/ct_denoise_test"
+    image_size: 256
+    channels: 1
+    logit_transform: false
+    uniform_dequantization: false
+    gaussian_dequantization: false
+    random_flip: true
+    rescaled: true
+    num_workers: 8
+    hu_min: -1024.0
+    hu_max: 1500.0
+    train_data_len: -1
+    sample_data_len: 128
+
+model:
+    type: "sg"
+    in_channels: 2
+    out_ch: 1
+    ch: 128
+    ch_mult: [1, 1, 2, 2, 4, 4]
+    num_res_blocks: 2
+    attn_resolutions: [16,]
+    dropout: 0.0
+    var_type: fixedsmall
+    ema_rate: 0.999
+    ema: True
+    resamp_with_conv: True
+    use_freq_cross_attn: True
+    freq_cross_attn_heads: 4
+
+diffusion:
+    beta_schedule: linear
+    beta_start: 0.0001
+    beta_end: 0.02
+    num_diffusion_timesteps: 1000
+
+training:
+    batch_size: 2
+    n_epochs: 10000
+    n_iters: 5000000
+    snapshot_freq: 500
+    validation_freq: 5000000000
+
+sampling:
+    batch_size: 2
+    ckpt_id: [259000]
+    last_only: True
+
+sampling_inter:
+    batch_size: 8
+    last_only: True
+
+sampling_fid:
+    batch_size: 4
+    last_only: True
+
+optim:
+    weight_decay: 0.000
+    optimizer: "Adam"
+    lr: 0.00002
+    beta1: 0.9
+    amsgrad: false
+    eps: 0.00000001

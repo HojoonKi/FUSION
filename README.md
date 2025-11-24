@@ -6,6 +6,10 @@ This repository implements Fast-DDPM (Fast Denoising Diffusion Probabilistic Mod
 
 The project extends the Fast-DDPM framework by incorporating Fourier-based feature extraction into the diffusion model architecture. This enhancement enables better frequency-domain processing of medical images.
 
+## Project Docs
+
+- [AI604 CT Denoising Roadmap](docs/AI604_CT_Denoising_Plan.md): 제안서와 데이터 전처리 노트북을 기반으로 한 향후 개발 계획과 즉시 실행 항목을 정리했습니다.
+
 ### Key Features
 
 - **Fast-DDPM Training**: Accelerated DDPM training with uniform and non-uniform scheduler sampling
@@ -141,7 +145,7 @@ Key parameters:
 ```
 FUSION/
 ├── configs/                # Configuration files
-├── datasets/              # Dataset loaders (BRATS, LDFDCT, PMUB)
+├── fusion_datasets/       # Dataset loaders (BRATS, LDFDCT, PMUB)
 ├── functions/             # Loss functions and utilities
 ├── models/
 │   ├── diffusion.py      # Main U-Net diffusion model with Fourier integration

@@ -24,6 +24,8 @@ model:
     ema_rate: 0.999
     ema: True
     resamp_with_conv: True
+    use_freq_cross_attn: True
+    freq_cross_attn_heads: 4
 
 diffusion:
     beta_schedule: linear
